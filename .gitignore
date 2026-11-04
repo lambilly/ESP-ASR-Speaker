@@ -1,0 +1,35 @@
+# ===== 私有 / 本地文件 =====
+# 项目记忆与历史版本（含个人笔记、内网地址，绝不上传）
+.workbuddy/
+.history/
+
+# 原始素材目录（电商图、手机原图，体积大且未整理）
+case/
+
+# 含 WiFi 密码与 API 密钥
+secrets.yaml
+
+# 含采购价、商家、购买记录，不公开
+ESP_ASR_Speaker_BOM清单.xlsx
+
+# ===== KiCad =====
+*.kicad_prl
+*-backups/
+_autosave-*
+*.kicad_sch-bak
+*.kicad_pcb-bak
+*.kicad_pro-bak
+fp-info-cache
+*.kicad_wks~
+
+# ===== ESPHome / 编译产物 =====
+.esphome/
+build/
+*.bin
+*.elf
+*.map
+
+# ===== 系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini

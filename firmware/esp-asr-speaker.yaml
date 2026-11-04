@@ -1,0 +1,499 @@
+# ============================================================
+# LED 状态含义速查表
+# 🔴 红色呼吸：OTA 升级中 / 红色常亮：WiFi 掉线
+# 🟠 橙色呼吸：温度过高 > 50℃
+# 🔵 青色呼吸：正在拾音听你说话 (LISTEN，3 秒无新指令自动回待机)
+# 🟢 彩虹渐变：音箱正在 TTS 播报 (TTS)
+# 🟢 绿色呼吸：空闲待机（过热 > 50℃ 时会被橙色覆盖）
+# 🔵 蓝色呼吸：蓝牙音箱模式 (Bluetooth 已开启)
+# 🟣 紫红常亮：音箱静音（短按 Mode 键触发）
+# ⚪ 白色闪烁：上电开机动画
+# ============================================================
+external_components:
+  - source: github://MexHigh/ESPHome-UART-Read-Line-Sensor
+    components: [ uart_read_line_sensor ]
+  - source: github://PxPert/a2dp_sink@master
+    components: [ a2dp_sink ]
+
+substitutions:
+  devicename: esp-asr-speaker
+  friendly_name: ESP ASR Speaker
+  hw_version: v2.0 
+
+esphome:
+  name: ${devicename}
+  name_add_mac_suffix: true
+  friendly_name: ${friendly_name}
+  project:
+    name: "lambilly.esp-asr-speaker"
+    version: ${hw_version}
+  includes:
+    - components/asrpro_uart_command.h
+    - components/asrpro_led_control.h  # 引入自定义的灯光控制头文件
+      
+  # 1. 硬件初始化（保持较早执行，尽早通电）
+  on_boot:
+    - priority: 600.0
+      then:
+        - output.turn_on: max98357_sd_mode
+
+  # 2. 灯光动画与状态同步（延迟执行，确保所有组件就绪）
+    - priority: -100.0
+      then:
+        # 开机强制解锁，防止被历史状态锁死
+        - globals.set:
+            id: led_disabled
+            value: 'false'        
+        # 开机动画（白色闪烁）- 用 brightness: 0% 代替 turn_off，防止触发 on_turn_off
+        # 亮度压到 45%：30 颗 WS2812 全白 100% 约 1.8A，叠加 ESP32 峰值会顶到 IP5306 输出上限，
+        # 电池电量低时容易在这一步掉电重启
+        - light.turn_on:
+            id: status_led
+            brightness: 45%
+            red: 100%
+            green: 100%
+            blue: 100%
+        - delay: 500ms
+        - light.turn_on:
+            id: status_led
+            brightness: 0%
+        - delay: 300ms
+        - light.turn_on:
+            id: status_led
+            brightness: 45%
+            red: 100%
+            green: 100%
+            blue: 100%
+        - delay: 500ms
+        - light.turn_on:
+            id: status_led
+            brightness: 0%
+        - delay: 300ms
+        
+        # 过渡到待机/当前状态（直接调用头文件函数）
+        - lambda: 'update_led_auto();'
+
+globals:
+  - id: led_disabled  # true = LED 由用户关闭
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: led_brightness_level # 记录当前亮度档位
+    type: int
+    restore_value: yes
+    initial_value: '100'    
+  - id: is_bt_mode # true = 蓝牙开启状态
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: is_hw_muted   # true = 硬件静音状态
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: is_rainbow_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+# ================= 拾音状态超时回收 =================
+# ASRPRO 只在识别时发一次指令，青色呼吸需要自己退回待机。
+# mode: restart 保证连续识别时重新计时，不会提前熄灭。
+script:
+  - id: listen_timeout
+    mode: restart
+    then:
+      - delay: 3s
+      - lambda: 'update_led_auto();'
+
+esp32:
+  board: esp-wrover-kit
+  variant: esp32
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    advanced:
+      minimum_chip_revision: "3.1"
+      sram1_as_iram: true
+
+psram:
+  mode: quad
+  speed: 80MHz
+http_request:
+  verify_ssl: false
+
+logger:
+  level: WARN
+debug:
+  update_interval: 30s
+api:
+  encryption:
+    key: !secret api_key
+web_server:
+  port: 80
+  version: 3
+  auth:
+    username: admin
+    password: !secret web_password
+    type: digest
+
+ota:
+  - platform: esphome
+    on_begin:
+      then:
+        - lambda: 'if(!id(led_disabled)) set_led_state(LED_OTA);' # OTA：红色呼吸（WiFi 掉线是红常亮，两者可区分）
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: ESP ASR Fallback
+    password: !secret ap_password
+  power_save_mode: none
+  on_disconnect:
+    then:
+      - lambda: 'set_led_state(LED_WIFI_ERROR);'
+  on_connect:
+    then:
+      - lambda: 'update_led_auto();'
+
+captive_portal:
+
+# ================= GPIO 输出配置 =================
+output:
+  - platform: gpio
+    pin: GPIO22
+    id: max98357_sd_mode
+
+# ================= UART 配置 =================
+uart:
+  id: asrpro_uart
+  tx_pin: GPIO14
+  rx_pin: GPIO13
+  baud_rate: 115200
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 1024
+
+# ================= I2S 音频输出 =================
+i2s_audio:
+  - id: i2s_out
+    i2s_lrclk_pin: GPIO26
+    i2s_bclk_pin: GPIO27
+
+speaker:
+  - platform: i2s_audio
+    id: max98357_speaker
+    i2s_audio_id: i2s_out
+    dac_type: external
+    i2s_dout_pin: GPIO25
+    channel: mono
+    sample_rate: 48000
+    bits_per_sample: 16bit
+    buffer_duration: 500ms
+    timeout: never
+
+# ================= A2DP Sink Hub 配置 =================
+a2dp_sink:
+  id: a2dp_hub
+  name: "ASR Speaker BT"
+  minimal_bluetooth: true
+
+# ================= 蓝牙音频源 =================
+media_source:
+  - platform: a2dp_sink
+    a2dp_sink_id: a2dp_hub
+    id: a2dp_source
+  - platform: audio_http
+    id: http_source
+    buffer_size: 300000
+
+# ================= 媒体播放器 (TTS + 蓝牙) =================
+media_player:
+  - platform: speaker_source
+    name: "Player"
+    id: tts_speaker
+    media_pipeline:               
+      speaker: max98357_speaker
+      sources:                     
+        - a2dp_source
+        - http_source          
+      format: MP3
+      sample_rate: 48000
+      num_channels: 1
+    on_state:
+      then:
+        # 第一段：无条件清锁。只要不在播放就解除彩虹锁。
+        # 修复点：原来清锁写在"外层条件为真"的分支里，播报中途切蓝牙/静音/关灯会让条件变假，
+        # 清锁代码执行不到，is_rainbow_active 永久停在 true，之后彩虹灯再也不亮。
+        - if:
+            condition:
+              lambda: 'return id(tts_speaker).state != media_player::MEDIA_PLAYER_STATE_PLAYING;'
+            then:
+              - globals.set:
+                  id: is_rainbow_active
+                  value: 'false'
+        # 第二段：只有灯效参与显示时才刷新
+        - if:
+            condition:
+              lambda: 'return !id(led_disabled) && !id(is_hw_muted) && !id(is_bt_mode);'
+            then:
+              - if:
+                  condition:
+                    lambda: 'return id(tts_speaker).state == media_player::MEDIA_PLAYER_STATE_PLAYING;'
+                  then:
+                    # 防抖锁：防止多次触发重启彩虹灯
+                    - if:
+                        condition:
+                          lambda: 'return !id(is_rainbow_active);'
+                        then:
+                          # 交给状态机判断，过热优先于彩虹，避免播报时吞掉过热提示
+                          - lambda: 'update_led_auto();'
+                          - globals.set:
+                              id: is_rainbow_active
+                              value: 'true'
+                  else:
+                    - lambda: 'update_led_auto();'
+
+# ================= WS2812 LED =================
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_led
+    chipset: ws2812
+    channel_colors: GRB
+    pin: GPIO19
+    num_leds: 30
+    use_psram: false
+    name: "LED Color"
+    icon: mdi:led-variant-outline
+    internal: false
+    restore_mode: ALWAYS_ON    
+    max_refresh_rate: 30ms
+    effects:
+      - pulse:
+          name: "Slow Pulse"
+          transition_length: 5s
+          update_interval: 6s
+          min_brightness: 15%
+          max_brightness: 85%
+      - addressable_rainbow:
+          name: "Rainbow"
+          speed: 10
+          width: 50
+    
+    on_turn_on:
+      then:
+        - globals.set:
+            id: led_disabled
+            value: 'false'
+            
+    on_turn_off:
+      then:
+        - globals.set:
+            id: led_disabled
+            value: 'true'
+
+# ================= 蓝牙与静音开关 =================
+switch:
+  # 蓝牙模式开关
+  - platform: a2dp_sink
+    type: bluetooth
+    a2dp_sink_id: a2dp_hub
+    name: "Bluetooth Mode"
+    icon: mdi:bluetooth-audio
+    id: bt_mode_switch
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - globals.set:
+          id: is_bt_mode
+          value: 'true'
+      - media_player.pause: tts_speaker
+      - lambda: 'update_led_auto();'
+    on_turn_off:
+      - globals.set:
+          id: is_bt_mode
+          value: 'false'
+      - lambda: 'update_led_auto();'
+
+  # 蓝牙连接状态（只读）
+  - platform: a2dp_sink
+    type: connection
+    a2dp_sink_id: a2dp_hub
+    name: "Bluetooth Connected"
+    icon: mdi:bluetooth-connect
+    id: bt_connection_status
+
+  # 硬件静音开关
+  - platform: template
+    name: "Speaker Mute"
+    id: hw_mute_switch
+    icon: mdi:volume-mute
+    lambda: 'return id(is_hw_muted);'
+    turn_on_action:
+      - globals.set:
+          id: is_hw_muted
+          value: 'true'
+      - output.turn_off: max98357_sd_mode
+      - lambda: 'update_led_auto();'
+    turn_off_action:
+      - globals.set:
+          id: is_hw_muted
+          value: 'false'
+      - output.turn_on: max98357_sd_mode
+      - lambda: 'update_led_auto();'
+
+# ================= 物理按键 =================
+binary_sensor:
+  # 1. LED 灯效控制键 (GPIO34)
+  - platform: gpio
+    id: key_led
+    name: "LED Key"
+    internal: true   
+    pin:
+      number: GPIO34
+      mode: INPUT   
+      inverted: true
+    on_multi_click:
+      # 短按：开关 LED
+      - timing:
+          - ON for 50ms to 800ms
+          - OFF for at least 50ms
+        then:
+          - globals.set:
+              id: led_disabled
+              value: !lambda 'return !id(led_disabled);'
+          - if:
+              condition:
+                lambda: 'return id(led_disabled);'
+              then:
+                - lambda: 'set_led_state(LED_OFF);'
+              else:
+                - lambda: 'update_led_auto();'
+
+      # 长按：循环切换亮度（阈值 800ms，与短按上限 800ms 对齐，消除按住 0.8~2s 无响应的死区）
+      - timing:
+          - ON for at least 800ms
+        then:
+          - logger.log: "长按：调节LED亮度"
+          - lambda: |-
+              if (id(led_brightness_level) == 100) {
+                id(led_brightness_level) = 50;
+              } else if (id(led_brightness_level) == 50) {
+                id(led_brightness_level) = 25;
+              } else {
+                id(led_brightness_level) = 100;
+              }
+              update_led_auto();
+
+  # 2. 模式切换键 (MODE KEY, GPIO35)
+  - platform: gpio
+    id: key_mode
+    name: "Mode Key"
+    internal: true
+    pin:
+      number: GPIO35
+      mode: INPUT  
+      inverted: true
+    on_multi_click:
+      # 短按：切换静音模式
+      - timing:
+          - ON for 50ms to 800ms
+          - OFF for at least 50ms
+        then:
+          - switch.toggle: hw_mute_switch          
+      # 长按：切换蓝牙模式（阈值 800ms，与短按上限对齐，消除死区）
+      - timing:
+          - ON for at least 800ms
+        then:
+          - if:
+              condition:
+                switch.is_on: bt_mode_switch
+              then:
+                - switch.turn_off: bt_mode_switch
+              else:
+                - switch.turn_on: bt_mode_switch
+
+# ================= 传感器与串口指令接收 =================
+one_wire:
+  - platform: gpio
+    id: ow_bus
+    pin: GPIO32
+
+sensor:
+  - platform: template
+    name: "LED Brightness"
+    id: led_brightness_display
+    icon: mdi:brightness-6
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      return id(led_brightness_level);
+      
+  - platform: wifi_signal
+    name: "WiFi RSSI"
+    icon: mdi:wifi
+    update_interval: 60s
+  - platform: uptime
+    name: "Uptime"
+    icon: mdi:clock-start
+    update_interval: 60s
+  - platform: debug
+    psram:
+      name: "Free PSRAM"
+      icon: mdi:memory
+      unit_of_measurement: "KB"
+      accuracy_decimals: 1
+      filters:
+        - multiply: 0.001
+  - platform: dallas_temp
+    one_wire_id: ow_bus
+    index: 0
+    name: "Temperature"
+    id: box_temperature
+    icon: mdi:thermometer-lines
+    update_interval: 15s
+    on_value:
+      then:
+        - lambda: 'update_led_auto();'
+
+text_sensor:
+  - platform: wifi_info
+    ssid:
+      name: "WiFi SSID"
+      icon: mdi:router-wireless
+    ip_address:
+      name: "IP Address"
+      icon: mdi:ip-network
+    mac_address:
+      name: "MAC Address"
+      icon: mdi:wifi-marker
+      
+  - platform: uart_read_line_sensor
+    name: "ASR CMD"
+    icon: mdi:account-voice
+    id: "uart_readline"
+    uart_id: asrpro_uart
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return !id(led_disabled) && !id(is_hw_muted) && !id(is_bt_mode) && id(tts_speaker).state != media_player::MEDIA_PLAYER_STATE_PLAYING;'
+            then:
+              - if:
+                  condition:
+                    lambda: 'return x == "LISTEN" || x.find("LISTEN") != std::string::npos;'
+                  then:
+                    - lambda: 'set_led_state(LED_LISTEN);'
+                    - script.execute: listen_timeout   # 3 秒无新指令自动回落待机
+                  else:
+                    - lambda: 'set_led_state(LED_STANDBY);'
+
+button:
+  - platform: restart
+    name: "Restart"
+    id: restart_button
+    entity_category: config
+  - platform: factory_reset
+    disabled_by_default: true
+    name: "Factory Reset"
+    id: factory_reset_all
